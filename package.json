@@ -8,9 +8,7 @@
     "cy:run": "cypress run",
     "cy:run:headed": "cypress run --headed --browser chrome",
     "agent:open": "node mcp-client/call.js cypress.open \"{}\"",
-    "agent:run": "node mcp-client/call.js cypress.runHeaded \"{\\\"spec\\\":\\\"cypress/e2e/admin_smoke.cy.js\\\"}\"",
-    "agent:run:email": "node mcp-client/call.js cypress.runHeaded \"{\\\"spec\\\":\\\"cypress/e2e/email_section.cy.js\\\"}\""
-
+    "agent:run:email:full": "node mcp-client/call.js cypress.runHeaded \"{\\\"spec\\\":\\\"cypress/e2e/email_full_flow.cy.js\\\"}\""
   },
   "keywords": [],
   "author": "",
