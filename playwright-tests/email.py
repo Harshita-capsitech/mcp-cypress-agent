@@ -1,6 +1,11 @@
-# -*- coding: utf-8 -*-
 """
 ActingOffice Email activity simulator (robust waits + compose/reply)
+
+Updated as requested:
+- Recipients must be selected ONLY from the dropdown list (NO typing).
+- Click row chevron to open list, then click recipient by visible text (name).
+- CC/BCC only if user provides --compose-cc / --compose-bcc.
+- Does NOT remove existing CC chips (UI defaults stay).
 """
 
 import os
@@ -30,10 +35,15 @@ def parse_args():
 
     p.add_argument("--email-route", default="/admin/emails")
 
-    p.add_argument("--compose-to", default="harshita.bhimishetty@capsitech.com")
+    p.add_argument("--compose-to", default=None, help="Recipient display name from allowed list")
+    p.add_argument("--compose-cc", default=None, help="Optional CC display name from list")
+    p.add_argument("--compose-bcc", default=None, help="Optional BCC display name from list")
+
     p.add_argument("--compose-subject", default="Playwright Email E2E")
     p.add_argument("--compose-body", default="Hello, this is an automated Playwright email test.")
 
+    p.add_argument("--stub-practice-config", action="store_true", help="(ignored) legacy/compat flag")
+    p.add_argument("--manual-login", action="store_true", help="Open login URL and wait until redirected to app host")
     p.add_argument("--debug", action="store_true", help="Save debug screenshots")
     return p.parse_args()
 
@@ -59,6 +69,12 @@ def do_login(page, args, app_host_regex: re.Pattern):
     page.goto(args.login_url, wait_until="domcontentloaded")
     page.wait_for_timeout(800)
 
+    if args.manual_login:
+        print("Manual login enabled. Please complete login in the opened browser...")
+        wait_for_host(page, app_host_regex, timeout_ms=180_000)
+        page.wait_for_timeout(1500)
+        return
+
     user_input = page.locator(args.user_selector).first
     expect(user_input).to_be_visible(timeout=60_000)
     user_input.fill(args.username)
@@ -71,7 +87,6 @@ def do_login(page, args, app_host_regex: re.Pattern):
     expect(submit).to_be_enabled(timeout=60_000)
 
     submit.click(no_wait_after=True)
-
     wait_for_host(page, app_host_regex, timeout_ms=180_000)
     page.wait_for_timeout(1500)
 
@@ -137,19 +152,6 @@ def open_compose_leftnav(page, debug=False) -> bool:
     except Exception:
         pass
 
-    try:
-        all_matches = page.get_by_text(re.compile(r"^compose$", re.I))
-        for i in range(min(all_matches.count(), 10)):
-            node = all_matches.nth(i)
-            if node.is_visible():
-                node.click(force=True)
-                page.wait_for_timeout(1200)
-                if debug:
-                    page.screenshot(path="compose_open.png", full_page=True)
-                return True
-    except Exception:
-        pass
-
     if click_first(page, 'button:has-text("Compose")', 3000):
         page.wait_for_timeout(1200)
         if debug:
@@ -163,9 +165,9 @@ def open_compose_leftnav(page, debug=False) -> bool:
 
 
 def get_compose_scope(page):
-    scope = page.locator('div:has-text("Compose email")').first
-    if scope.count() > 0:
-        return scope
+    dlg_send = page.locator('[role="dialog"]:has(button:has-text("Send"))').first
+    if dlg_send.count() > 0:
+        return dlg_send
 
     scope2 = page.locator('div:has(button:has-text("Send"))').first
     if scope2.count() > 0:
@@ -174,71 +176,152 @@ def get_compose_scope(page):
     return page.locator("body")
 
 
-def focus_to_in_compose(page, scope) -> bool:
-    to_input = scope.locator('input[placeholder="Search recipient"]').first
-    if to_input.count() > 0 and to_input.is_visible():
-        to_input.click()
-        page.wait_for_timeout(150)
-        return True
-
+def ensure_compose_open(page, debug=False):
+    scope = get_compose_scope(page)
     try:
-        to_label = scope.get_by_text(re.compile(r"^to$", re.I)).first
-        if to_label.count() > 0:
-            cand = to_label.locator('xpath=following::input[1]')
-            if cand.count() > 0 and cand.first.is_visible():
-                cand.first.click()
-                page.wait_for_timeout(150)
+        scope.get_by_text(re.compile(r"^to$", re.I)).first.wait_for(state="visible", timeout=8000)
+        scope.locator('button:has-text("Send")').first.wait_for(state="visible", timeout=8000)
+        return scope
+    except Exception:
+        if debug:
+            page.screenshot(path="compose_not_open.png", full_page=True)
+        raise RuntimeError("Compose panel is not open (otherwise it clicks email list).")
+
+
+def wait_for_suggestion_panel(page, timeout_ms=8000) -> bool:
+    candidates = [
+        page.locator('[role="listbox"]').first,
+        page.locator('.ms-Suggestions').first,
+        page.locator('.ms-Suggestions-container').first,
+        page.locator('.ms-Callout').first,
+    ]
+    start = time.time()
+    while (time.time() - start) * 1000 < timeout_ms:
+        for c in candidates:
+            try:
+                if c.count() > 0 and c.is_visible():
+                    return True
+            except Exception:
+                pass
+        page.wait_for_timeout(150)
+    return False
+
+
+def click_row_dropdown(page, scope, field: str, debug=False) -> bool:
+    """
+    Click the row dropdown chevron for To/Cc/Bcc row.
+    We try multiple ancestor depths; the last button in that row is usually the chevron.
+    """
+    field = field.lower().strip()
+    try:
+        label = scope.get_by_text(re.compile(rf"^{field}$", re.I)).first
+        label.wait_for(state="visible", timeout=8000)
+
+        for level in [1, 2, 3, 4, 5, 6]:
+            row = label.locator(f"xpath=ancestor::div[{level}]")
+            if row.count() == 0:
+                continue
+
+            btn = row.locator("button").last
+            if btn.count() > 0 and btn.is_visible():
+                btn.click(force=True)
+                page.wait_for_timeout(200)
                 return True
     except Exception:
         pass
 
+    if debug:
+        page.screenshot(path=f"{field}_chevron_not_found.png", full_page=True)
     return False
 
 
-def type_compose(page, to_addr: str, subject: str, body: str, debug=False):
-    scope = get_compose_scope(page)
+def open_recipient_list(page, scope, field: str, debug=False) -> bool:
+    field = field.lower().strip()
 
-    if debug:
-        page.screenshot(path="compose_scope.png", full_page=True)
+    if field == "bcc":
+        try:
+            bcc_btn = scope.get_by_text(re.compile(r"^bcc$", re.I)).first
+            if bcc_btn.count() > 0 and bcc_btn.is_visible():
+                bcc_btn.click(force=True)
+                page.wait_for_timeout(300)
+        except Exception:
+            if debug:
+                page.screenshot(path="bcc_button_click_failed.png", full_page=True)
 
-    if not focus_to_in_compose(page, scope):
-        if debug:
-            page.screenshot(path="to_field_not_found.png", full_page=True)
-        print("⚠️ Could not focus To field inside compose.")
-        return
+    click_row_dropdown(page, scope, field, debug=debug)
 
-    # ---- type email ----
-    page.keyboard.press("Control+A")
-    page.keyboard.type(to_addr, delay=20)
-    page.wait_for_timeout(600)
+    ok = wait_for_suggestion_panel(page, timeout_ms=8000)
+    if not ok and debug:
+        page.screenshot(path=f"{field}_dropdown_not_open.png", full_page=True)
+    return ok
 
-    # wait loading...
-    loading_any = page.get_by_text(re.compile(r"loading\.\.\.", re.I))
+
+def select_recipient_from_list(page, value: str, debug=False) -> bool:
+    """
+    STRICT: select ONLY from list. NO typing.
+    Tries exact match first; then contains match (for items like ' <email>').
+    """
+    value = (value or "").strip()
+    if not value:
+        return False
+
+    exact_re = re.compile(rf"^\s*{re.escape(value)}\s*$", re.I)
+    contains_re = re.compile(re.escape(value), re.I)
+
     try:
-        if loading_any.count() > 0:
-            loading_any.first.wait_for(state="hidden", timeout=15000)
+        listbox = page.locator('[role="listbox"]').first
+        if listbox.count() > 0 and listbox.is_visible():
+            opt = listbox.get_by_text(exact_re).first
+            if opt.count() == 0:
+                opt = listbox.get_by_text(contains_re).first
+
+            if opt.count() > 0:
+                opt.wait_for(state="visible", timeout=8000)
+                opt.click(force=True)
+                page.wait_for_timeout(250)
+                return True
     except Exception:
         pass
 
-    # ✅ NEW: select the row that contains the email (your dropdown is plain text list)
-    email_only = to_addr.strip().lower()
-    try:
-        row = page.get_by_text(re.compile(re.escape(email_only), re.I)).first
-        row.wait_for(state="visible", timeout=8000)
-        row.click()
-        page.wait_for_timeout(300)
-    except Exception:
-        # fallback keyboard
+    if debug:
+        page.screenshot(path="recipient_value_not_found.png", full_page=True)
+    return False
+
+
+def pick_recipient(page, scope, field: str, value: str, debug=False):
+    """
+    NO typing. Only open list and click item from list.
+    """
+    if not value:
+        return
+
+    if not open_recipient_list(page, scope, field, debug=debug):
+        print(f"⚠️ {field.upper()} list not opened.")
+        return
+
+    if not select_recipient_from_list(page, value, debug=debug):
         page.keyboard.press("ArrowDown")
         page.wait_for_timeout(150)
         page.keyboard.press("Enter")
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(250)
 
-    # Commit chip by leaving field
     page.keyboard.press("Tab")
-    page.wait_for_timeout(250)
+    page.wait_for_timeout(200)
 
-    # ---- Subject ----
+
+def type_compose(page, to_value: str, cc_value: str, bcc_value: str, subject: str, body: str, debug=False):
+    scope = ensure_compose_open(page, debug=debug)
+    if debug:
+        page.screenshot(path="compose_scope.png", full_page=True)
+
+    pick_recipient(page, scope, "to", to_value, debug=debug)
+
+    if cc_value:
+        pick_recipient(page, scope, "cc", cc_value, debug=debug)
+
+    if bcc_value:
+        pick_recipient(page, scope, "bcc", bcc_value, debug=debug)
+
     subj = scope.locator('input[placeholder="Add a subject"], input[placeholder="Subject"], input[placeholder*="subject" i]')
     if subj.count() > 0 and subj.first.is_visible():
         subj.first.click(force=True)
@@ -248,7 +331,6 @@ def type_compose(page, to_addr: str, subject: str, body: str, debug=False):
 
     page.wait_for_timeout(200)
 
-    # ---- Body ----
     editable = scope.locator('[contenteditable="true"]').first
     if editable.count() > 0 and editable.is_visible():
         editable.click(force=True)
@@ -262,21 +344,15 @@ def type_compose(page, to_addr: str, subject: str, body: str, debug=False):
 
 
 def click_send(page, debug=False) -> bool:
-    scope = get_compose_scope(page)
-
-    send_btn = scope.locator('button:has-text("Send")').first
-    if send_btn.count() > 0 and send_btn.is_visible():
-        send_btn.click()
-        page.wait_for_timeout(1500)
-        return True
-
-    if click_first(page, 'button:has-text("Send")', 3000):
+    scope = ensure_compose_open(page, debug=debug)
+    btn = scope.locator('button:has-text("Send")').first
+    if btn.count() > 0 and btn.is_visible():
+        btn.click(force=True)
         page.wait_for_timeout(1500)
         return True
 
     if debug:
         page.screenshot(path="send_not_found.png", full_page=True)
-    print("⚠️ Send not found.")
     return False
 
 
@@ -299,7 +375,7 @@ def run_email_flow(page, args):
         reply_actions(page)
 
     if open_compose_leftnav(page, debug=args.debug):
-        type_compose(page, args.compose_to, args.compose_subject, args.compose_body, debug=args.debug)
+        type_compose(page, args.compose_to, args.compose_cc, args.compose_bcc, args.compose_subject, args.compose_body, debug=args.debug)
         click_send(page, debug=args.debug)
 
 
@@ -308,8 +384,8 @@ def main():
 
     args.username = args.username or os.getenv("AO_UAT_USER")
     args.password = args.password or os.getenv("AO_UAT_PASS")
-    if not args.username or not args.password:
-        raise SystemExit("Missing credentials. Provide --username/--password or set AO_UAT_USER/AO_UAT_PASS env vars.")
+    if not args.manual_login and (not args.username or not args.password):
+        raise SystemExit("Missing credentials. Provide --username/--password or set AO_UAT_USER/AO_UAT_PASS env vars, OR use --manual-login.")
 
     app_host = urlparse(args.app_base).netloc
     if not app_host:
@@ -321,6 +397,7 @@ def main():
     print(f"[{datetime.now().isoformat(timespec='seconds')}] Start Email activity")
     print("Email URL :", email_url)
     print("Active    :", args.per_url_seconds, f"({human(args.per_url_seconds)})")
+    print("ManualLogin:", args.manual_login)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=args.headless)

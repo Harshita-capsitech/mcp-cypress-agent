@@ -1,6 +1,7 @@
 {
   "name": "mcp-cypress-agent",
   "version": "1.0.0",
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "mcp": "node mcp/server.js",
@@ -8,17 +9,25 @@
     "cy:run": "cypress run",
     "cy:run:headed": "cypress run --headed --browser chrome",
     "agent:open": "node mcp-client/call.js cypress.open \"{}\"",
-    "agent:run:email:full": "node mcp-client/call.js cypress.runHeaded \"{\\\"spec\\\":\\\"cypress/e2e/email_full_flow.cy.js\\\"}\""
+    "agent:run:email:full": "node mcp-client/call.js cypress.runHeaded \"{\\\"spec\\\":\\\"cypress/e2e/email_full_flow.cy.js\\\"}\"",
+
+    "build": "tsc",
+    "server:pw": "node dist/mcp-playwright-server.js",
+    "repl:pw": "node dist/repl-client.js",
+    "agent:cli": "node dist/agent-cli.js"
+
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.2",
     "cypress": "^15.9.0",
     "execa": "^9.6.1",
+    "playwright": "^1.57.0",
     "wait-on": "^9.0.3",
     "zod": "^4.3.5"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.9",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
   }
 }
