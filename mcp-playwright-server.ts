@@ -1,3 +1,4 @@
+import path from "node:path";
 import { chromium, type Browser, type BrowserContext, type Page, type Locator } from "playwright";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -8,6 +9,8 @@ const APP_BASE = process.env.APP_BASE ?? "http://localhost:5000";
 const EMAIL_ROUTE = process.env.EMAIL_ROUTE ?? "/admin/emails";
 const TARGET_AFTER_LOGIN = `${APP_BASE.replace(/\/$/, "")}${EMAIL_ROUTE}`;
 const LOGIN_URL = process.env.LOGIN_URL ?? "https://accountsdev.actingoffice.com/login";
+
+const HEADLESS = process.env.HEADLESS !== "false";
 
 type State = {
   browser?: Browser;
@@ -25,7 +28,15 @@ function escapeRegex(s: string) {
 
 async function ensureBrowser() {
   if (state.browser && state.context && state.page) return;
-  state.browser = await chromium.launch({ headless: false });
+
+  const launchArgs: string[] =
+    process.platform === "linux" ? ["--no-sandbox", "--disable-setuid-sandbox"] : [];
+
+  state.browser = await chromium.launch({
+    headless: HEADLESS,
+    args: launchArgs,
+  });
+
   state.context = await state.browser.newContext({ ignoreHTTPSErrors: true });
   state.page = await state.context.newPage();
 }
@@ -39,9 +50,11 @@ async function getPage(): Promise<Page> {
 async function bootstrap() {
   if (state.bootstrapped) return;
   const page = await getPage();
+
   await page.goto(TARGET_AFTER_LOGIN, { waitUntil: "domcontentloaded" }).catch(async () => {
     await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
   });
+
   state.bootstrapped = true;
 }
 
@@ -92,29 +105,21 @@ async function getComposeScope(page: Page): Promise<Locator> {
 async function ensureComposeOpen(page: Page): Promise<Locator> {
   const scope = await getComposeScope(page);
 
-  const sendBtn = scope.locator('button:has-text("Send")').first();
-  const toLabel = scope.getByText(/^to$/i).first();
-
-  const ok =
-    (await sendBtn.isVisible().catch(() => false)) &&
-    (await toLabel.isVisible().catch(() => false));
-
-  if (!ok) {
-    throw new Error("Compose panel is not open. Run open_compose first (or compose couldn't open it).");
-  }
+  // strict: To label + Send must exist
+  await scope.getByText(/^to$/i).first().waitFor({ state: "visible", timeout: 10000 });
+  await scope.locator('button:has-text("Send")').first().waitFor({ state: "visible", timeout: 10000 });
 
   return scope;
 }
 
-/**
- * Clear CC chips only if user didn't provide cc=
- */
+// -------------------- CC clear --------------------
 async function clearCcChips(scope: Locator) {
   const page = scope.page();
   const ccLabel = scope.getByText(/^cc$/i).first();
   if (!(await ccLabel.isVisible().catch(() => false))) return;
 
-  const ccRow = ccLabel.locator("xpath=ancestor::div[2]").first();
+  const ccRow =
+    ccLabel.locator("xpath=ancestor::div[2]").first().or(ccLabel.locator("xpath=ancestor::div[3]").first());
 
   const removeBtns = ccRow.locator(
     'button[aria-label*="remove" i], button[title*="remove" i], button:has-text("×"), i[data-icon-name="Cancel"], i[data-icon-name="ChromeClose"]'
@@ -126,9 +131,7 @@ async function clearCcChips(scope: Locator) {
   }
 }
 
-/**
- * Open dropdown by clicking right edge of input (chevron area).
- */
+// -------------------- Dropdown recipient selection --------------------
 async function openDropdownByInputChevron(
   scope: Locator,
   field: "to" | "cc" | "bcc"
@@ -144,16 +147,17 @@ async function openDropdownByInputChevron(
   }
 
   const label = scope.getByText(new RegExp(`^${field}$`, "i")).first();
-  await label.waitFor({ state: "visible", timeout: 8000 });
+  await label.waitFor({ state: "visible", timeout: 10000 });
 
   const input = label.locator("xpath=following::input[1]").first();
-  await input.waitFor({ state: "visible", timeout: 8000 });
+  await input.waitFor({ state: "visible", timeout: 10000 });
   await input.click({ force: true });
   await page.waitForTimeout(100);
 
   const box = await input.boundingBox();
   if (!box) throw new Error(`Could not get bounding box for ${field} input`);
 
+  // click chevron area inside input
   await page.mouse.click(box.x + box.width - 10, box.y + box.height / 2);
   await page.waitForTimeout(200);
 
@@ -181,7 +185,7 @@ async function clickSuggestionBelowInput(
   page: Page,
   value: string,
   inputBox: { x: number; y: number; width: number; height: number },
-  timeoutMs = 8000
+  timeoutMs = 10000
 ) {
   const re = new RegExp(escapeRegex(value), "i");
   const start = Date.now();
@@ -198,7 +202,7 @@ async function clickSuggestionBelowInput(
       if (!box) continue;
 
       const below = box.y > (inputBox.y + inputBox.height - 2);
-      const nearX = box.x >= (inputBox.x - 30) && box.x <= (inputBox.x + inputBox.width + 500);
+      const nearX = box.x >= (inputBox.x - 30) && box.x <= (inputBox.x + inputBox.width + 600);
 
       if (below && nearX) {
         await el.scrollIntoViewIfNeeded().catch(() => {});
@@ -214,13 +218,11 @@ async function clickSuggestionBelowInput(
   throw new Error(`Suggestion '${value}' did not appear below input`);
 }
 
-/**
- * filter (2-4 chars) + select from list
- */
 async function pickRecipient(scope: Locator, field: "to" | "cc" | "bcc", value: string) {
   const page = scope.page();
   const inputBox = await openDropdownByInputChevron(scope, field);
 
+  // filter typing (only for search)
   const filterText = value.trim().slice(0, 4);
   if (filterText.length > 0) {
     await page.keyboard.type(filterText, { delay: 30 });
@@ -238,25 +240,26 @@ async function pickRecipient(scope: Locator, field: "to" | "cc" | "bcc", value: 
       await row.click({ force: true });
       await page.waitForTimeout(200);
     } else {
-      await clickSuggestionBelowInput(page, value, inputBox, 8000);
+      await clickSuggestionBelowInput(page, value, inputBox, 10000);
     }
   } else {
-    await clickSuggestionBelowInput(page, value, inputBox, 8000);
+    await clickSuggestionBelowInput(page, value, inputBox, 10000);
   }
 
   await page.keyboard.press("Tab");
   await page.waitForTimeout(150);
 }
 
-/**
- * Attachments helper
- */
+// -------------------- Attachments (portable paths) --------------------
 async function addAttachments(page: Page, scope: Locator, filePaths: string[]) {
   if (!filePaths.length) return;
 
+  // normalize across OS
+  const files = filePaths.map((p) => path.resolve(p));
+
   const fileInput = scope.locator('input[type="file"]').first();
   if ((await fileInput.count()) > 0) {
-    await fileInput.setInputFiles(filePaths);
+    await fileInput.setInputFiles(files);
     await page.waitForTimeout(1500);
     return;
   }
@@ -273,7 +276,7 @@ async function addAttachments(page: Page, scope: Locator, filePaths: string[]) {
         page.waitForEvent("filechooser", { timeout: 8000 }),
         btn.click({ force: true }),
       ]);
-      await chooser.setFiles(filePaths);
+      await chooser.setFiles(files);
       await page.waitForTimeout(1500);
       return;
     }
@@ -282,6 +285,7 @@ async function addAttachments(page: Page, scope: Locator, filePaths: string[]) {
   throw new Error("Could not find file input or Attach button in compose.");
 }
 
+// -------------------- Compose --------------------
 async function typeCompose(
   page: Page,
   toValue: string,
@@ -293,6 +297,7 @@ async function typeCompose(
 ) {
   const scope = await ensureComposeOpen(page);
 
+  // clear CC only if cc not provided
   if (!ccValue) {
     await clearCcChips(scope);
   }
@@ -339,65 +344,102 @@ async function clickSend(page: Page) {
   return false;
 }
 
-// ---------------- Inbox open email ----------------
+// -------------------- Inbox loading + open email --------------------
+async function waitForInboxToLoad(page: Page, timeoutMs = 15000) {
+  const timeMarker = page.locator('text=/\\b\\d{1,2}:\\d{2}\\s?(AM|PM)\\b/i').first();
+  const dateMarker = page.locator('text=/\\b\\d{2}\\/\\d{2}\\/\\d{4}\\b/').first();
+
+  await Promise.race([
+    timeMarker.waitFor({ state: "visible", timeout: timeoutMs }).catch(() => {}),
+    dateMarker.waitFor({ state: "visible", timeout: timeoutMs }).catch(() => {}),
+  ]);
+
+  await page.waitForTimeout(600);
+
+  const tm = await page.locator('text=/\\b\\d{1,2}:\\d{2}\\s?(AM|PM)\\b/i').count().catch(() => 0);
+  const dm = await page.locator('text=/\\b\\d{2}\\/\\d{2}\\/\\d{4}\\b/').count().catch(() => 0);
+
+  if ((tm + dm) === 0) throw new Error("Inbox did not finish loading.");
+}
+
 async function gotoInbox(page: Page) {
   const inbox = page.getByText(/^inbox$/i).first();
   if (await inbox.isVisible().catch(() => false)) {
     await inbox.click({ force: true });
     await page.waitForTimeout(800);
   }
+  await waitForInboxToLoad(page, 15000);
 }
 
 async function openEmailByFilters(page: Page, opts: { subject?: string; from?: string; index?: number }) {
   await gotoInbox(page);
 
-  const rows = page.locator('[role="listitem"], [role="row"], .emailRow, .messageRow');
-  const count = await rows.count();
-  if (count === 0) throw new Error("No emails found.");
-
   const subjectRe = opts.subject ? new RegExp(escapeRegex(opts.subject), "i") : null;
   const fromRe = opts.from ? new RegExp(escapeRegex(opts.from), "i") : null;
 
+  const markers = page.locator(
+    'text=/\\b\\d{1,2}:\\d{2}\\s?(AM|PM)\\b/i, text=/\\b\\d{2}\\/\\d{2}\\/\\d{4}\\b/'
+  );
+
+  const mCount = await markers.count();
+  if (mCount === 0) throw new Error("No emails found (markers=0).");
+
+  const rowCandidates: Locator[] = [];
+  const max = Math.min(mCount, 50);
+
+  for (let i = 0; i < max; i++) {
+    const mark = markers.nth(i);
+    for (const level of [2, 3, 4, 5, 6]) {
+      rowCandidates.push(mark.locator(`xpath=ancestor::div[${level}]`).first());
+    }
+  }
+
+  async function tryClickRow(row: Locator) {
+    if (!(await row.isVisible().catch(() => false))) return false;
+    await row.scrollIntoViewIfNeeded().catch(() => {});
+    await row.click({ force: true }).catch(() => {});
+    await page.waitForTimeout(800);
+    return true;
+  }
+
   if (subjectRe && fromRe) {
-    for (let i = 0; i < Math.min(count, 100); i++) {
-      const t = (await rows.nth(i).innerText().catch(() => "")) || "";
+    for (const r of rowCandidates) {
+      const t = (await r.innerText().catch(() => "")) || "";
       if (subjectRe.test(t) && fromRe.test(t)) {
-        await rows.nth(i).click({ force: true });
-        await page.waitForTimeout(800);
-        return { openedIndex: i, matched: "subject+from" };
+        if (await tryClickRow(r)) return { matched: "subject+from" };
       }
     }
   }
 
   if (subjectRe) {
-    for (let i = 0; i < Math.min(count, 100); i++) {
-      const t = (await rows.nth(i).innerText().catch(() => "")) || "";
+    for (const r of rowCandidates) {
+      const t = (await r.innerText().catch(() => "")) || "";
       if (subjectRe.test(t)) {
-        await rows.nth(i).click({ force: true });
-        await page.waitForTimeout(800);
-        return { openedIndex: i, matched: "subject" };
+        if (await tryClickRow(r)) return { matched: "subject" };
       }
     }
   }
 
   if (fromRe) {
-    for (let i = 0; i < Math.min(count, 100); i++) {
-      const t = (await rows.nth(i).innerText().catch(() => "")) || "";
+    for (const r of rowCandidates) {
+      const t = (await r.innerText().catch(() => "")) || "";
       if (fromRe.test(t)) {
-        await rows.nth(i).click({ force: true });
-        await page.waitForTimeout(800);
-        return { openedIndex: i, matched: "from" };
+        if (await tryClickRow(r)) return { matched: "from" };
       }
     }
   }
 
-  const idx = Math.max(0, Math.min(opts.index ?? 0, count - 1));
-  await rows.nth(idx).click({ force: true });
-  await page.waitForTimeout(800);
-  return { openedIndex: idx, matched: "index" };
+  const idx = Math.max(0, opts.index ?? 0);
+  const mark = markers.nth(Math.min(idx, max - 1));
+  for (const level of [2, 3, 4, 5, 6]) {
+    const row = mark.locator(`xpath=ancestor::div[${level}]`).first();
+    if (await tryClickRow(row)) return { matched: "index" };
+  }
+
+  throw new Error("Could not click any inbox row.");
 }
 
-// ---------------- MCP wiring ----------------
+// -------------------- MCP server --------------------
 const server = new Server(
   { name: "actingoffice-playwright", version: "1.0.0" },
   { capabilities: { tools: {} } }
@@ -429,9 +471,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       { name: "open_login", description: "Open emails URL to start auth flow", inputSchema: { type: "object", properties: {}, required: [] } },
       { name: "wait_logged_in", description: "Wait until emails page loads", inputSchema: { type: "object", properties: { timeoutMs: { type: "number" } }, required: [] } },
       { name: "goto_emails", description: "Navigate to /admin/emails", inputSchema: { type: "object", properties: {}, required: [] } },
-
       { name: "open_email", description: "Open email from Inbox by subject/from or index", inputSchema: { type: "object", properties: { subject: { type: "string" }, from: { type: "string" }, index: { type: "number" } }, required: [] } },
-
       { name: "open_compose", description: "Click Compose", inputSchema: { type: "object", properties: {}, required: [] } },
       {
         name: "compose",
@@ -487,7 +527,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const { subject, from, index } = OpenEmailArgs.parse(args);
       const page = await getPage();
       const res = await openEmailByFilters(page, { subject, from, index });
-      return { content: [{ type: "text", text: `Opened email (${res.matched}) at index ${res.openedIndex}` }] };
+      return { content: [{ type: "text", text: `Opened email (${res.matched})` }] };
     }
 
     if (name === "open_compose") {
