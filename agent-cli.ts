@@ -5,55 +5,60 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 const transport = new StdioClientTransport({
   command: "node",
   args: ["dist/mcp-playwright-server.js"],
-  env: Object.fromEntries(
-    Object.entries(process.env).filter(([, v]) => typeof v === "string")
-  ) as Record<string, string>,
+  env: Object.fromEntries(Object.entries(process.env).filter(([, v]) => typeof v === "string")) as Record<string, string>,
 });
 
-const client = new Client(
-  { name: "ao-email-agent", version: "1.0.0" },
-  { capabilities: {} }
-);
+const client = new Client({ name: "ao-email-agent", version: "1.0.0" }, { capabilities: {} });
 
 function okText(text: string) {
   return { content: [{ type: "text", text }] };
+}
+
+function getKVLong(key: string, raw: string) {
+  const re = new RegExp(`${key}\\s*=\\s*([^]+?)(?:\\s+[a-zA-Z]+\\s*=|$)`, "i");
+  return re.exec(raw)?.[1]?.trim();
+}
+
+function getAttachments(raw: string): string[] | undefined {
+  const v = getKVLong("attach", raw) ?? getKVLong("attachments", raw);
+  if (!v) return undefined;
+  return v.split(";").map(s => s.trim()).filter(Boolean);
 }
 
 async function handlePrompt(prompt: string) {
   const raw = prompt.trim();
   const p = raw.toLowerCase();
 
-
   if (p === "login") {
     await client.callTool({ name: "open_login", arguments: {} });
-
-    const r1: any = await client.callTool({
-      name: "wait_logged_in",
-      arguments: {},
-    });
-
-    const r2: any = await client.callTool({
-      name: "goto_emails",
-      arguments: {},
-    });
-
-    return {
-      content: [
-        { type: "text", text: "Login detected  Redirected to /admin/emails " },
-        ...(r1?.content ?? []),
-        ...(r2?.content ?? []),
-      ],
-    };
+    const r1: any = await client.callTool({ name: "wait_logged_in", arguments: {} });
+    const r2: any = await client.callTool({ name: "goto_emails", arguments: {} });
+    return { content: [{ type: "text", text: "Login ok" }, ...(r1?.content ?? []), ...(r2?.content ?? [])] };
   }
 
-  if (p.includes("go to emails") || p.includes("open emails") || p === "emails") {
+  if (p === "emails") {
     return client.callTool({ name: "goto_emails", arguments: {} });
   }
 
+  if (p.startsWith("open_email")) {
+    const subject = getKVLong("subject", raw);
+    const from = getKVLong("from", raw);
+    const idxStr = getKVLong("index", raw);
+    const index = idxStr ? Number(idxStr) : undefined;
+
+    return client.callTool({
+      name: "open_email",
+      arguments: { subject, from, index },
+    });
+  }
+
   if (p.startsWith("compose")) {
-    const to = /to\s*=\s*([^\s]+)/i.exec(raw)?.[1];
-    const subject = /subject\s*=\s*([^]+?)(?:\s+body\s*=|$)/i.exec(raw)?.[1]?.trim();
-    const body = /body\s*=\s*([^]+)$/i.exec(raw)?.[1]?.trim();
+    const to = getKVLong("to", raw);
+    const cc = getKVLong("cc", raw);
+    const bcc = getKVLong("bcc", raw);
+    const subject = getKVLong("subject", raw);
+    const body = getKVLong("body", raw);
+    const attachments = getAttachments(raw);
 
     await client.callTool({ name: "open_compose", arguments: {} });
 
@@ -62,7 +67,7 @@ async function handlePrompt(prompt: string) {
         content: [
           {
             type: "text",
-            text: "Missing fields. Use: compose to=<email> subject=<text> body=<text>",
+            text: "Use: compose to=<name> subject=<text> body=<text> [cc=<name>] [bcc=<name>] [attach=path1;path2]",
           },
         ],
         isError: true,
@@ -71,7 +76,7 @@ async function handlePrompt(prompt: string) {
 
     return client.callTool({
       name: "compose",
-      arguments: { to, subject, body, autoSend: false },
+      arguments: { to, cc, bcc, subject, body, attachments, autoSend: false },
     });
   }
 
@@ -80,8 +85,9 @@ async function handlePrompt(prompt: string) {
   }
 
   if (p.startsWith("screenshot")) {
-    const name = raw.split(/\s+/)[1] ?? "agent.png";
-    return client.callTool({ name: "screenshot", arguments: { path: name } });
+    const parts = raw.split(/\s+/);
+    const path = parts[1] ?? "agent.png";
+    return client.callTool({ name: "screenshot", arguments: { path } });
   }
 
   if (p === "help") {
@@ -90,7 +96,8 @@ async function handlePrompt(prompt: string) {
         "Commands:",
         "  login",
         "  emails",
-        "  compose to=<email> subject=<text> body=<text>",
+        "  open_email [subject=<text>] [from=<text>] [index=<number>]",
+        "  compose to=<name> subject=<text> body=<text> [cc=<name>] [bcc=<name>]",
         "  send",
         "  screenshot [file.png]",
         "  exit",
@@ -98,7 +105,7 @@ async function handlePrompt(prompt: string) {
     );
   }
 
-  return okText("Unknown command. Try: login, emails, compose, send, screenshot, help");
+  return okText("Unknown command. Try: login, emails, open_email, compose, send, screenshot, help");
 }
 
 async function main() {

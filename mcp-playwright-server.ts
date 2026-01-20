@@ -107,8 +107,27 @@ async function ensureComposeOpen(page: Page): Promise<Locator> {
 }
 
 /**
- * Open dropdown for a given recipient field by clicking RIGHT EDGE of input (chevron area).
- * Returns bounding box of the input for geometry-based suggestion clicking.
+ * Clear CC chips only if user didn't provide cc=
+ */
+async function clearCcChips(scope: Locator) {
+  const page = scope.page();
+  const ccLabel = scope.getByText(/^cc$/i).first();
+  if (!(await ccLabel.isVisible().catch(() => false))) return;
+
+  const ccRow = ccLabel.locator("xpath=ancestor::div[2]").first();
+
+  const removeBtns = ccRow.locator(
+    'button[aria-label*="remove" i], button[title*="remove" i], button:has-text("×"), i[data-icon-name="Cancel"], i[data-icon-name="ChromeClose"]'
+  );
+
+  while ((await removeBtns.count()) > 0) {
+    await removeBtns.nth(0).click({ force: true }).catch(() => {});
+    await page.waitForTimeout(100);
+  }
+}
+
+/**
+ * Open dropdown by clicking right edge of input (chevron area).
  */
 async function openDropdownByInputChevron(
   scope: Locator,
@@ -116,7 +135,6 @@ async function openDropdownByInputChevron(
 ): Promise<{ x: number; y: number; width: number; height: number }> {
   const page = scope.page();
 
-  // reveal bcc field only if requested
   if (field === "bcc") {
     const bccBtn = scope.getByText(/^bcc$/i).first();
     if (await bccBtn.isVisible().catch(() => false)) {
@@ -136,16 +154,12 @@ async function openDropdownByInputChevron(
   const box = await input.boundingBox();
   if (!box) throw new Error(`Could not get bounding box for ${field} input`);
 
-  // click chevron area at right edge
   await page.mouse.click(box.x + box.width - 10, box.y + box.height / 2);
   await page.waitForTimeout(200);
 
   return box;
 }
 
-/**
- * Try to detect Fluent UI dropdown container; may not always be detectable.
- */
 async function tryGetSuggestionsContainer(page: Page, timeoutMs = 1200): Promise<Locator | null> {
   const candidates = [
     page.locator(".ms-Callout").first(),
@@ -163,9 +177,6 @@ async function tryGetSuggestionsContainer(page: Page, timeoutMs = 1200): Promise
   return null;
 }
 
-/**
- * Click the visible suggestion BELOW the input (dropdown area) by geometry.
- */
 async function clickSuggestionBelowInput(
   page: Page,
   value: string,
@@ -186,10 +197,8 @@ async function clickSuggestionBelowInput(
       const box = await el.boundingBox().catch(() => null);
       if (!box) continue;
 
-      // dropdown is below the input
       const below = box.y > (inputBox.y + inputBox.height - 2);
-      // dropdown is near input x-range
-      const nearX = box.x >= (inputBox.x - 30) && box.x <= (inputBox.x + inputBox.width + 400);
+      const nearX = box.x >= (inputBox.x - 30) && box.x <= (inputBox.x + inputBox.width + 500);
 
       if (below && nearX) {
         await el.scrollIntoViewIfNeeded().catch(() => {});
@@ -206,24 +215,18 @@ async function clickSuggestionBelowInput(
 }
 
 /**
- * Select recipient from dropdown:
- * - open dropdown
- * - type 2–4 chars to filter
- * - click suggestion row (container-based if possible else geometry)
+ * filter (2-4 chars) + select from list
  */
 async function pickRecipient(scope: Locator, field: "to" | "cc" | "bcc", value: string) {
   const page = scope.page();
-
   const inputBox = await openDropdownByInputChevron(scope, field);
 
-  // filter/search by 2–4 chars (not full)
   const filterText = value.trim().slice(0, 4);
   if (filterText.length > 0) {
     await page.keyboard.type(filterText, { delay: 30 });
     await page.waitForTimeout(250);
   }
 
-  // 1) try container-based click
   const container = await tryGetSuggestionsContainer(page, 1200);
   if (container) {
     const row = container
@@ -241,27 +244,42 @@ async function pickRecipient(scope: Locator, field: "to" | "cc" | "bcc", value: 
     await clickSuggestionBelowInput(page, value, inputBox, 8000);
   }
 
-  // commit chip
   await page.keyboard.press("Tab");
   await page.waitForTimeout(150);
 }
 
-async function clearCcChips(scope: Locator) {
-  const page = scope.page();
-  const ccLabel = scope.getByText(/^cc$/i).first();
-  if (!(await ccLabel.isVisible().catch(() => false))) return;
+/**
+ * Attachments helper
+ */
+async function addAttachments(page: Page, scope: Locator, filePaths: string[]) {
+  if (!filePaths.length) return;
 
-  const ccRow = ccLabel.locator("xpath=ancestor::div[2]").first();
-
-  const removeBtns = ccRow.locator(
-    'button[aria-label*="remove" i], button[title*="remove" i], button:has-text("×"), i[data-icon-name="Cancel"], i[data-icon-name="ChromeClose"]'
-  );
-
-  // click until none left
-  while ((await removeBtns.count()) > 0) {
-    await removeBtns.nth(0).click({ force: true }).catch(() => {});
-    await page.waitForTimeout(100);
+  const fileInput = scope.locator('input[type="file"]').first();
+  if ((await fileInput.count()) > 0) {
+    await fileInput.setInputFiles(filePaths);
+    await page.waitForTimeout(1500);
+    return;
   }
+
+  const attachButtons = [
+    scope.locator('button:has-text("Attach")').first(),
+    scope.locator('button[aria-label*="attach" i]').first(),
+    scope.locator('[role="button"][aria-label*="attach" i]').first(),
+  ];
+
+  for (const btn of attachButtons) {
+    if (await btn.isVisible().catch(() => false)) {
+      const [chooser] = await Promise.all([
+        page.waitForEvent("filechooser", { timeout: 8000 }),
+        btn.click({ force: true }),
+      ]);
+      await chooser.setFiles(filePaths);
+      await page.waitForTimeout(1500);
+      return;
+    }
+  }
+
+  throw new Error("Could not find file input or Attach button in compose.");
 }
 
 async function typeCompose(
@@ -270,11 +288,11 @@ async function typeCompose(
   ccValue: string | undefined,
   bccValue: string | undefined,
   subject: string,
-  body: string
+  body: string,
+  attachments: string[] | undefined
 ) {
   const scope = await ensureComposeOpen(page);
 
-  // ✅ Clear CC only if user didn’t mention cc=
   if (!ccValue) {
     await clearCcChips(scope);
   }
@@ -283,7 +301,6 @@ async function typeCompose(
   if (ccValue) await pickRecipient(scope, "cc", ccValue);
   if (bccValue) await pickRecipient(scope, "bcc", bccValue);
 
-  // Subject
   const subj = scope
     .locator('input[placeholder="Add a subject"], input[placeholder="Subject"], input[placeholder*="subject" i]')
     .first();
@@ -297,7 +314,6 @@ async function typeCompose(
 
   await page.waitForTimeout(150);
 
-  // Body
   const editable = scope.locator('[contenteditable="true"]').first();
   if ((await editable.count()) > 0 && (await editable.isVisible().catch(() => false))) {
     await editable.click({ force: true });
@@ -305,6 +321,10 @@ async function typeCompose(
   } else {
     await scope.click({ position: { x: 120, y: 260 } });
     await page.keyboard.type(body, { delay: 10 });
+  }
+
+  if (attachments?.length) {
+    await addAttachments(page, scope, attachments);
   }
 }
 
@@ -317,6 +337,64 @@ async function clickSend(page: Page) {
     return true;
   }
   return false;
+}
+
+// ---------------- Inbox open email ----------------
+async function gotoInbox(page: Page) {
+  const inbox = page.getByText(/^inbox$/i).first();
+  if (await inbox.isVisible().catch(() => false)) {
+    await inbox.click({ force: true });
+    await page.waitForTimeout(800);
+  }
+}
+
+async function openEmailByFilters(page: Page, opts: { subject?: string; from?: string; index?: number }) {
+  await gotoInbox(page);
+
+  const rows = page.locator('[role="listitem"], [role="row"], .emailRow, .messageRow');
+  const count = await rows.count();
+  if (count === 0) throw new Error("No emails found.");
+
+  const subjectRe = opts.subject ? new RegExp(escapeRegex(opts.subject), "i") : null;
+  const fromRe = opts.from ? new RegExp(escapeRegex(opts.from), "i") : null;
+
+  if (subjectRe && fromRe) {
+    for (let i = 0; i < Math.min(count, 100); i++) {
+      const t = (await rows.nth(i).innerText().catch(() => "")) || "";
+      if (subjectRe.test(t) && fromRe.test(t)) {
+        await rows.nth(i).click({ force: true });
+        await page.waitForTimeout(800);
+        return { openedIndex: i, matched: "subject+from" };
+      }
+    }
+  }
+
+  if (subjectRe) {
+    for (let i = 0; i < Math.min(count, 100); i++) {
+      const t = (await rows.nth(i).innerText().catch(() => "")) || "";
+      if (subjectRe.test(t)) {
+        await rows.nth(i).click({ force: true });
+        await page.waitForTimeout(800);
+        return { openedIndex: i, matched: "subject" };
+      }
+    }
+  }
+
+  if (fromRe) {
+    for (let i = 0; i < Math.min(count, 100); i++) {
+      const t = (await rows.nth(i).innerText().catch(() => "")) || "";
+      if (fromRe.test(t)) {
+        await rows.nth(i).click({ force: true });
+        await page.waitForTimeout(800);
+        return { openedIndex: i, matched: "from" };
+      }
+    }
+  }
+
+  const idx = Math.max(0, Math.min(opts.index ?? 0, count - 1));
+  await rows.nth(idx).click({ force: true });
+  await page.waitForTimeout(800);
+  return { openedIndex: idx, matched: "index" };
 }
 
 // ---------------- MCP wiring ----------------
@@ -333,7 +411,14 @@ const ComposeArgs = z.object({
   bcc: z.string().optional(),
   subject: z.string(),
   body: z.string(),
+  attachments: z.array(z.string()).optional(),
   autoSend: z.boolean().default(false),
+});
+
+const OpenEmailArgs = z.object({
+  subject: z.string().optional(),
+  from: z.string().optional(),
+  index: z.number().optional(),
 });
 
 const ScreenshotArgs = z.object({ path: z.string().default("mcp_debug.png") });
@@ -344,10 +429,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       { name: "open_login", description: "Open emails URL to start auth flow", inputSchema: { type: "object", properties: {}, required: [] } },
       { name: "wait_logged_in", description: "Wait until emails page loads", inputSchema: { type: "object", properties: { timeoutMs: { type: "number" } }, required: [] } },
       { name: "goto_emails", description: "Navigate to /admin/emails", inputSchema: { type: "object", properties: {}, required: [] } },
+
+      { name: "open_email", description: "Open email from Inbox by subject/from or index", inputSchema: { type: "object", properties: { subject: { type: "string" }, from: { type: "string" }, index: { type: "number" } }, required: [] } },
+
       { name: "open_compose", description: "Click Compose", inputSchema: { type: "object", properties: {}, required: [] } },
       {
         name: "compose",
-        description: "Filter then select recipients from dropdown and fill subject/body. Clears CC if cc not provided.",
+        description: "Compose with dropdown recipients + optional attachments; clears CC if cc not provided",
         inputSchema: {
           type: "object",
           properties: {
@@ -356,6 +444,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             bcc: { type: "string" },
             subject: { type: "string" },
             body: { type: "string" },
+            attachments: { type: "array", items: { type: "string" } },
             autoSend: { type: "boolean", default: false },
           },
           required: ["to", "subject", "body"],
@@ -394,6 +483,13 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       return { content: [{ type: "text", text: `Opened emails: ${TARGET_AFTER_LOGIN}` }] };
     }
 
+    if (name === "open_email") {
+      const { subject, from, index } = OpenEmailArgs.parse(args);
+      const page = await getPage();
+      const res = await openEmailByFilters(page, { subject, from, index });
+      return { content: [{ type: "text", text: `Opened email (${res.matched}) at index ${res.openedIndex}` }] };
+    }
+
     if (name === "open_compose") {
       const page = await getPage();
       const ok = await openComposeLeftNav(page);
@@ -403,7 +499,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     if (name === "compose") {
-      const { to, cc, bcc, subject, body, autoSend } = ComposeArgs.parse(args);
+      const { to, cc, bcc, subject, body, attachments, autoSend } = ComposeArgs.parse(args);
       const page = await getPage();
 
       try {
@@ -414,7 +510,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         await ensureComposeOpen(page);
       }
 
-      await typeCompose(page, to, cc, bcc, subject, body);
+      await typeCompose(page, to, cc, bcc, subject, body, attachments);
 
       if (autoSend) {
         const sent = await clickSend(page);
