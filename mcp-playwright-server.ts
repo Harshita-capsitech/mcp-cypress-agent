@@ -11,6 +11,7 @@ const TARGET_AFTER_LOGIN = `${APP_BASE.replace(/\/$/, "")}${EMAIL_ROUTE}`;
 const LOGIN_URL = process.env.LOGIN_URL ?? "https://accountsdev.actingoffice.com/login";
 
 const HEADLESS = process.env.HEADLESS !== "false";
+const PROXY_SERVER = process.env.PROXY_SERVER; // optional: http://proxy.company.com:8080
 
 type State = {
   browser?: Browser;
@@ -26,15 +27,33 @@ function escapeRegex(s: string) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+async function safeGoto(page: Page, url: string, tries = 3) {
+  let lastErr: any;
+  for (let i = 0; i < tries; i++) {
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+      return;
+    } catch (e) {
+      lastErr = e;
+      await page.waitForTimeout(1000);
+    }
+  }
+  throw lastErr;
+}
+
 async function ensureBrowser() {
   if (state.browser && state.context && state.page) return;
 
   const launchArgs: string[] =
     process.platform === "linux" ? ["--no-sandbox", "--disable-setuid-sandbox"] : [];
 
+  // ✅ Use installed Chrome (best for enterprise networks)
+  // If Chrome is not installed, remove channel line.
   state.browser = await chromium.launch({
+    channel: "chrome",
     headless: HEADLESS,
     args: launchArgs,
+    proxy: PROXY_SERVER ? { server: PROXY_SERVER } : undefined,
   });
 
   state.context = await state.browser.newContext({ ignoreHTTPSErrors: true });
@@ -51,8 +70,9 @@ async function bootstrap() {
   if (state.bootstrapped) return;
   const page = await getPage();
 
-  await page.goto(TARGET_AFTER_LOGIN, { waitUntil: "domcontentloaded" }).catch(async () => {
-    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
+  // ✅ retry navigation (prevents chrome-error://chromewebdata flake)
+  await safeGoto(page, TARGET_AFTER_LOGIN).catch(async () => {
+    await safeGoto(page, LOGIN_URL);
   });
 
   state.bootstrapped = true;
@@ -105,14 +125,15 @@ async function getComposeScope(page: Page): Promise<Locator> {
 async function ensureComposeOpen(page: Page): Promise<Locator> {
   const scope = await getComposeScope(page);
 
-  // strict: To label + Send must exist
   await scope.getByText(/^to$/i).first().waitFor({ state: "visible", timeout: 10000 });
   await scope.locator('button:has-text("Send")').first().waitFor({ state: "visible", timeout: 10000 });
 
   return scope;
 }
 
-// -------------------- CC clear --------------------
+/**
+ * Clear CC chips only if user didn't provide cc=
+ */
 async function clearCcChips(scope: Locator) {
   const page = scope.page();
   const ccLabel = scope.getByText(/^cc$/i).first();
@@ -131,7 +152,9 @@ async function clearCcChips(scope: Locator) {
   }
 }
 
-// -------------------- Dropdown recipient selection --------------------
+/**
+ * Open dropdown by clicking right edge of input (chevron area).
+ */
 async function openDropdownByInputChevron(
   scope: Locator,
   field: "to" | "cc" | "bcc"
@@ -157,7 +180,6 @@ async function openDropdownByInputChevron(
   const box = await input.boundingBox();
   if (!box) throw new Error(`Could not get bounding box for ${field} input`);
 
-  // click chevron area inside input
   await page.mouse.click(box.x + box.width - 10, box.y + box.height / 2);
   await page.waitForTimeout(200);
 
@@ -218,11 +240,13 @@ async function clickSuggestionBelowInput(
   throw new Error(`Suggestion '${value}' did not appear below input`);
 }
 
+/**
+ * filter (2-4 chars) + select from dropdown
+ */
 async function pickRecipient(scope: Locator, field: "to" | "cc" | "bcc", value: string) {
   const page = scope.page();
   const inputBox = await openDropdownByInputChevron(scope, field);
 
-  // filter typing (only for search)
   const filterText = value.trim().slice(0, 4);
   if (filterText.length > 0) {
     await page.keyboard.type(filterText, { delay: 30 });
@@ -250,11 +274,12 @@ async function pickRecipient(scope: Locator, field: "to" | "cc" | "bcc", value: 
   await page.waitForTimeout(150);
 }
 
-// -------------------- Attachments (portable paths) --------------------
+/**
+ * Attachments helper (portable paths)
+ */
 async function addAttachments(page: Page, scope: Locator, filePaths: string[]) {
   if (!filePaths.length) return;
 
-  // normalize across OS
   const files = filePaths.map((p) => path.resolve(p));
 
   const fileInput = scope.locator('input[type="file"]').first();
@@ -285,7 +310,6 @@ async function addAttachments(page: Page, scope: Locator, filePaths: string[]) {
   throw new Error("Could not find file input or Attach button in compose.");
 }
 
-// -------------------- Compose --------------------
 async function typeCompose(
   page: Page,
   toValue: string,
@@ -297,7 +321,6 @@ async function typeCompose(
 ) {
   const scope = await ensureComposeOpen(page);
 
-  // clear CC only if cc not provided
   if (!ccValue) {
     await clearCcChips(scope);
   }
@@ -344,7 +367,7 @@ async function clickSend(page: Page) {
   return false;
 }
 
-// -------------------- Inbox loading + open email --------------------
+// Inbox load wait
 async function waitForInboxToLoad(page: Page, timeoutMs = 15000) {
   const timeMarker = page.locator('text=/\\b\\d{1,2}:\\d{2}\\s?(AM|PM)\\b/i').first();
   const dateMarker = page.locator('text=/\\b\\d{2}\\/\\d{2}\\/\\d{4}\\b/').first();
@@ -355,11 +378,6 @@ async function waitForInboxToLoad(page: Page, timeoutMs = 15000) {
   ]);
 
   await page.waitForTimeout(600);
-
-  const tm = await page.locator('text=/\\b\\d{1,2}:\\d{2}\\s?(AM|PM)\\b/i').count().catch(() => 0);
-  const dm = await page.locator('text=/\\b\\d{2}\\/\\d{2}\\/\\d{4}\\b/').count().catch(() => 0);
-
-  if ((tm + dm) === 0) throw new Error("Inbox did not finish loading.");
 }
 
 async function gotoInbox(page: Page) {
@@ -439,7 +457,7 @@ async function openEmailByFilters(page: Page, opts: { subject?: string; from?: s
   throw new Error("Could not click any inbox row.");
 }
 
-// -------------------- MCP server --------------------
+// MCP server
 const server = new Server(
   { name: "actingoffice-playwright", version: "1.0.0" },
   { capabilities: { tools: {} } }
@@ -504,8 +522,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   try {
     if (name === "open_login") {
       const page = await getPage();
-      await page.goto(TARGET_AFTER_LOGIN, { waitUntil: "domcontentloaded" });
-      return { content: [{ type: "text", text: `Opened: ${TARGET_AFTER_LOGIN}` }] };
+      await safeGoto(page, TARGET_AFTER_LOGIN).catch(async () => safeGoto(page, LOGIN_URL));
+      return { content: [{ type: "text", text: `Opened: ${page.url()}` }] };
     }
 
     if (name === "wait_logged_in") {
@@ -518,9 +536,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     if (name === "goto_emails") {
       const page = await getPage();
-      await page.goto(TARGET_AFTER_LOGIN, { waitUntil: "domcontentloaded" });
+      await safeGoto(page, TARGET_AFTER_LOGIN);
       await page.waitForTimeout(1200);
-      return { content: [{ type: "text", text: `Opened emails: ${TARGET_AFTER_LOGIN}` }] };
+      return { content: [{ type: "text", text: `Opened emails: ${page.url()}` }] };
     }
 
     if (name === "open_email") {
@@ -567,10 +585,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     if (name === "screenshot") {
-      const { path } = ScreenshotArgs.parse(args);
+      const { path: out } = ScreenshotArgs.parse(args);
       const page = await getPage();
-      await page.screenshot({ path, fullPage: true });
-      return { content: [{ type: "text", text: `Saved screenshot: ${path}` }] };
+      await page.screenshot({ path: out, fullPage: true });
+      return { content: [{ type: "text", text: `Saved screenshot: ${out}` }] };
     }
 
     if (name === "close") {
